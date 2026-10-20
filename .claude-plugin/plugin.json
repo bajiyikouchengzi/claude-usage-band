@@ -1,6 +1,6 @@
 {
   "name": "usage-band",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Band above the prompt: 5h/7d limits, last turn tokens, t/s, cache, cost, context %",
   "author": { "name": "bajiyikouchengzi" },
   "homepage": "https://github.com/bajiyikouchengzi/claude-usage-band",

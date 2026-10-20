@@ -100,11 +100,13 @@ const bandSvg = (s: Stats, now: number): { source: string; width: number } => {
       gap(6)
       text(reset, 'm')
     }
-    if (l.kind === 'five_hour' && s.cap5h !== undefined) {
+    if (l.kind === 'five_hour' && s.spent5h !== undefined) {
       gap(10)
-      text('cap', 'l')
-      gap(4)
-      text(`≈${money(s.cap5h)}`, `v t-${hue}`, true)
+      text(money(s.spent5h), `v t-${hue}`, true)
+      if (s.cap5h !== undefined) {
+        gap(4)
+        text(`/ ≈${money(s.cap5h)}`, 'm')
+      }
     }
   })
 
@@ -127,7 +129,11 @@ const bandSvg = (s: Stats, now: number): { source: string; width: number } => {
 
   if (s.costUsd !== undefined || s.ctxPercent !== undefined) {
     if (s.limits.length || s.last) sep()
-    if (s.costUsd !== undefined) text(`$${s.costUsd.toFixed(2)}`, 'v t-amber', true)
+    if (s.costUsd !== undefined) {
+      text('session', 'l')
+      gap(4)
+      text(money(s.costUsd), 'v t-amber', true)
+    }
     if (s.ctxPercent !== undefined) {
       const hue = hueAt(s.ctxPercent, 'sky')
       if (s.costUsd !== undefined) gap(16)
@@ -159,55 +165,118 @@ const label: Record<string, string> = { five_hour: '5h', seven_day: '7d' }
 
 const money = (v: number) => `$${v.toFixed(v >= 100 ? 0 : v >= 10 ? 1 : 2)}`
 
-// One observation: this session spent dCost while the 5h window rose dPct points.
-type Sample = { t: number; dCost: number; dPct: number }
-const SAMPLES = 'cap5h.samples'
-const KEEP_MS = 7 * 24 * 3600_000
-// Below this many points of movement the 0.1-point rounding swamps the ratio.
-const MIN_PCT = 2
-
-const capFrom = (samples: Sample[]) => {
-  const pct = samples.reduce((n, x) => n + x.dPct, 0)
-  const usd = samples.reduce((n, x) => n + x.dCost, 0)
-  return pct >= MIN_PCT ? (usd / pct) * 100 : undefined
-}
-
 const altText = (s: Stats, now: number) =>
   [
     ...s.limits.map(l => `${label[l.kind] ?? l.kind} ${l.percentUsed}% (resets in ${left(l.resetsAt, now)})`),
-    s.cap5h !== undefined && `5h cap about ${money(s.cap5h)} at API prices`,
+    s.spent5h !== undefined &&
+      `5h window spend ${money(s.spent5h)}${s.cap5h !== undefined ? ` of about ${money(s.cap5h)}` : ''} at API prices`,
     s.last && `in ${k(s.last.input)}, out ${k(s.last.output)}, ${s.last.tps} t/s, cache ${k(s.last.cacheRead)}`,
-    s.costUsd !== undefined && `$${s.costUsd.toFixed(2)}`,
+    s.costUsd !== undefined && `this session ${money(s.costUsd)}`,
     s.ctxPercent !== undefined && `context ${s.ctxPercent}%`,
   ]
     .filter(Boolean)
     .join(' · ')
 
-// The last reading of this session: the cost and the 5h percentage, and which window.
-// A module variable on purpose: after a reload the next reading only sets a fresh baseline.
-let baseline: { cost: number; pct: number; window: string } | undefined
+// Spend is kept in files every session on this machine can read, under
+// <claude config dir>/usage-band/:
+//   ledger/<session id>.json  one per session, written by that session alone:
+//                             its last cost reading and its spend per 5h window
+//   windows.json              per window, all sessions' spend and how far the
+//                             percentage moved while they spent; feeds cap5h
+type WindowSpend = { usd: number; pct0: number; pct: number }
+type SessionLedger = { lastCost: number; windows: Record<string, WindowSpend> }
+type WindowTotal = { usd: number; dpct: number; at: number }
+
+const KEEP_MS = 7 * 24 * 3600_000
+// A session file untouched for this long holds nothing of the current window.
+const LIVE_MS = 6 * 3600_000
+// Below this many points of movement the 0.1-point rounding swamps the ratio.
+const MIN_PCT = 2
+
+const capFrom = (windows: WindowTotal[]) => {
+  const pct = windows.reduce((n, x) => n + x.dpct, 0)
+  const usd = windows.reduce((n, x) => n + x.usd, 0)
+  return pct >= MIN_PCT ? (usd / pct) * 100 : undefined
+}
+
+// The window a reading belongs to, by its reset time rounded to the minute.
+const windowKey = (resetsAt: string) => new Date(Math.round(Date.parse(resetsAt) / 60_000) * 60_000).toISOString()
+
+async function dataDir($: EngineInterface) {
+  const config = await $.env.get('CLAUDE_CONFIG_DIR')
+  const home = await $.env.get('HOME')
+  const base = config ?? (home ? `${home}/.claude` : undefined)
+  return base && `${base}/usage-band`
+}
+
+async function readJson<T>($: EngineInterface, path: string): Promise<T | undefined> {
+  try {
+    return JSON.parse(await $.fs.read(path)) as T
+  } catch {
+    return undefined
+  }
+}
+
+// Adds this session's spend since its last reading to the current window, then totals
+// the window over every session's ledger and refreshes the cap estimate.
+async function measureSpend($: EngineInterface, resetsAt: string, pct: number, cost: number) {
+  const dir = await dataDir($)
+  if (!dir) return undefined
+  const now = await $.clock.now()
+  const w = windowKey(resetsAt)
+
+  const minePath = `${dir}/ledger/${await $.session.id()}.json`
+  const mine = (await readJson<SessionLedger>($, minePath)) ?? { lastCost: cost, windows: {} }
+  // A cost below the last reading means the ledger restarted (a resumed process): all of it is new.
+  const delta = cost >= mine.lastCost ? cost - mine.lastCost : cost
+  // A session whose last reading was in an earlier window crossed a reset: the new
+  // window started at 0%, not at this reading's percentage.
+  const isCrossed = !mine.windows[w] && Object.keys(mine.windows).some(k => k < w)
+  const cur = mine.windows[w] ?? { usd: 0, pct0: isCrossed ? 0 : pct, pct }
+  const windows: Record<string, WindowSpend> = { [w]: { usd: cur.usd + delta, pct0: Math.min(cur.pct0, pct), pct } }
+  for (const [k, v] of Object.entries(mine.windows)) {
+    if (k !== w && now - Date.parse(k) < KEEP_MS) windows[k] = v
+  }
+  const next: SessionLedger = { lastCost: cost, windows }
+  await $.fs.write(minePath, JSON.stringify(next))
+
+  let usd = 0
+  let pct0 = pct
+  const files = await $.fs.list(`${dir}/ledger`).catch(() => [])
+  for (const f of files) {
+    if (f.kind !== 'file' || !f.name.endsWith('.json') || now - f.mtimeMs > LIVE_MS) continue
+    const x = (await readJson<SessionLedger>($, `${dir}/ledger/${f.name}`))?.windows?.[w]
+    if (x) {
+      usd += x.usd
+      pct0 = Math.min(pct0, x.pct0)
+    }
+  }
+
+  const totals = (await readJson<Record<string, WindowTotal>>($, `${dir}/windows.json`)) ?? {}
+  const kept: Record<string, WindowTotal> = { [w]: { usd, dpct: pct - pct0, at: now } }
+  for (const [k, v] of Object.entries(totals)) {
+    if (k !== w && now - v.at < KEEP_MS) kept[k] = v
+  }
+  await $.fs.write(`${dir}/windows.json`, JSON.stringify(kept))
+
+  return { spent5h: usd, cap5h: capFrom(Object.values(kept)) }
+}
 
 async function apply($: EngineInterface, r: SessionMeasureInput) {
   const { value: s = empty } = await $.state.get(stats)
-  let cap5h = s.cap5h
+  let { spent5h, cap5h } = s
   const fh = r.rateLimits.find(l => l.kind === 'five_hour')
   const cost = r.cost?.usd
-  if (fh && cost !== undefined) {
-    const now = await $.clock.now()
-    const window = fh.resetsAt ? new Date(Math.round(Date.parse(fh.resetsAt) / 60_000) * 60_000).toISOString() : ''
-    let samples = (((await $.store.get(SAMPLES)) as Sample[] | undefined) ?? []).filter(x => now - x.t < KEEP_MS)
-    if (baseline && baseline.window === window && cost > baseline.cost && fh.percentUsed >= baseline.pct) {
-      samples = [...samples, { t: now, dCost: cost - baseline.cost, dPct: fh.percentUsed - baseline.pct }].slice(-2000)
-      await $.store.set(SAMPLES, samples)
-    }
-    baseline = { cost, pct: fh.percentUsed, window }
-    cap5h = capFrom(samples)
+  if (fh?.resetsAt && cost !== undefined) {
+    const m = await measureSpend($, fh.resetsAt, fh.percentUsed, cost)
+    if (m) ({ spent5h, cap5h } = m)
   }
   await $.state.set(stats, {
     ...s,
     limits: r.rateLimits.map(({ kind, percentUsed, resetsAt }): Limit => ({ kind, percentUsed, resetsAt })),
     ctxPercent: r.context.percent,
     costUsd: cost,
+    spent5h,
     cap5h,
   })
 }
@@ -270,7 +339,13 @@ export const register: Register = on => {
             <Text dimColor>{label[l.kind] ?? l.kind} </Text>
             <Text bold color={tone(l.percentUsed)}>{l.percentUsed}%</Text>
             <Text dimColor> {left(l.resetsAt, now)}</Text>
-            {l.kind === 'five_hour' && s.cap5h !== undefined && <Text dimColor> cap ≈{money(s.cap5h)}</Text>}
+            {l.kind === 'five_hour' && s.spent5h !== undefined && (
+              <Text>
+                {'  '}
+                <Text bold>{money(s.spent5h)}</Text>
+                {s.cap5h !== undefined && <Text dimColor> / ≈{money(s.cap5h)}</Text>}
+              </Text>
+            )}
           </Text>
         ))}
         {s.last && (
@@ -281,7 +356,12 @@ export const register: Register = on => {
             <Text bold>{k(s.last.cacheRead)}</Text>
           </Text>
         )}
-        {s.costUsd !== undefined && <Text key="cost" bold>${s.costUsd.toFixed(2)}</Text>}
+        {s.costUsd !== undefined && (
+          <Text key="cost">
+            <Text dimColor>session </Text>
+            <Text bold>{money(s.costUsd)}</Text>
+          </Text>
+        )}
         {s.ctxPercent !== undefined && (
           <Text key="ctx">
             <Text dimColor>ctx </Text><Text bold color={tone(s.ctxPercent)}>{s.ctxPercent}%</Text>

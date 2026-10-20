@@ -1,0 +1,6 @@
+{
+  "name": "claude-usage-band",
+  "owner": { "name": "bajiyikouchengzi" },
+  "description": "A usage band above the Claude Code prompt",
+  "plugins": [{ "name": "usage-band", "source": "./" }]
+}

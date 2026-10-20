@@ -180,14 +180,17 @@ const altText = (s: Stats, now: number) =>
 // Spend is kept in files every session on this machine can read, under
 // <claude config dir>/usage-band/:
 //   ledger/<session id>.json  one per session, written by that session alone:
-//                             its last cost reading and its spend per 5h window
+//                             its last cost reading and its spend per 5h window;
+//                             `pre` is what it spent in the window before it began
+//                             tracking, counted in the spend but not in the cap
 //   windows.json              per window, all sessions' spend and how far the
 //                             percentage moved while they spent; feeds cap5h
-type WindowSpend = { usd: number; pct0: number; pct: number }
+type WindowSpend = { usd: number; pre?: number; pct0: number; pct: number }
 type SessionLedger = { lastCost: number; windows: Record<string, WindowSpend> }
 type WindowTotal = { usd: number; dpct: number; at: number }
 
 const KEEP_MS = 7 * 24 * 3600_000
+const FIVE_HOURS_MS = 5 * 3600_000
 // A session file untouched for this long holds nothing of the current window.
 const LIVE_MS = 6 * 3600_000
 // Below this many points of movement the 0.1-point rounding swamps the ratio.
@@ -233,14 +236,27 @@ async function measureSpend($: EngineInterface, resetsAt: string, pct: number, c
   // window started at 0%, not at this reading's percentage.
   const isCrossed = !mine.windows[w] && Object.keys(mine.windows).some(k => k < w)
   const cur = mine.windows[w] ?? { usd: 0, pct0: isCrossed ? 0 : pct, pct }
-  const windows: Record<string, WindowSpend> = { [w]: { usd: cur.usd + delta, pct0: Math.min(cur.pct0, pct), pct } }
+  // A session that began inside this window spent all of its cost in it, the part
+  // before tracking began too. Settled once per window; 0 for one begun earlier.
+  let ownPre = cur.pre
+  if (ownPre === undefined) {
+    const hasEarlierWindow = Object.keys(mine.windows).some(k => k < w)
+    const startedAt = (await $.session.usage()).startedAt
+    const isInside = !hasEarlierWindow && startedAt >= Date.parse(resetsAt) - FIVE_HOURS_MS
+    ownPre = isInside ? Math.max(0, mine.lastCost - cur.usd) : 0
+  }
+  const windows: Record<string, WindowSpend> = {
+    [w]: { usd: cur.usd + delta, pre: ownPre, pct0: Math.min(cur.pct0, pct), pct },
+  }
   for (const [k, v] of Object.entries(mine.windows)) {
     if (k !== w && now - Date.parse(k) < KEEP_MS) windows[k] = v
   }
   const next: SessionLedger = { lastCost: cost, windows }
   await $.fs.write(minePath, JSON.stringify(next))
 
+  // usd: spend tracked against the percentage's movement; pre: spend from before tracking
   let usd = 0
+  let pre = 0
   let pct0 = pct
   const files = await $.fs.list(`${dir}/ledger`).catch(() => [])
   for (const f of files) {
@@ -248,6 +264,7 @@ async function measureSpend($: EngineInterface, resetsAt: string, pct: number, c
     const x = (await readJson<SessionLedger>($, `${dir}/ledger/${f.name}`))?.windows?.[w]
     if (x) {
       usd += x.usd
+      pre += x.pre ?? 0
       pct0 = Math.min(pct0, x.pct0)
     }
   }
@@ -259,7 +276,7 @@ async function measureSpend($: EngineInterface, resetsAt: string, pct: number, c
   }
   await $.fs.write(`${dir}/windows.json`, JSON.stringify(kept))
 
-  return { spent5h: usd, cap5h: capFrom(Object.values(kept)) }
+  return { spent5h: usd + pre, cap5h: capFrom(Object.values(kept)) }
 }
 
 async function apply($: EngineInterface, r: SessionMeasureInput) {

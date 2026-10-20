@@ -39,7 +39,7 @@ Then run `/reload-plugins` (or start a new session). The band appears once the s
 
 It uses Claude Code's plugin hooks API only (`session.measure`, `turn.complete`, `ui.render` on `AbovePrompt`). Every figure is one Claude Code already keeps locally, the same as `/cost` and the status line. The only file it writes is its own spend ledger in `~/.claude/usage-band/`. The plugin makes no network requests, reads no credentials and does not modify the app.
 
-The 5h spend counts Claude Code sessions on this machine that have the plugin loaded. Use on claude.ai, the mobile app or other machines draws on the same 5h limit but is not counted, and makes the size estimate read low.
+The 5h spend counts Claude Code sessions on this machine that have the plugin loaded. A session that began inside the current window is counted in full, including what it spent before the plugin loaded; one that began earlier is counted from when the plugin loaded. Use on claude.ai, the mobile app or other machines draws on the same 5h limit but is not counted, and makes the size estimate read low.
 
 插件只使用 Claude Code 官方插件接口，数据来自 Claude Code 本地已有的统计，不发网络请求、不读取凭证、不修改客户端。
 

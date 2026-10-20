@@ -1,4 +1,4 @@
-import type { Register } from 'claude-code'
+import type { EngineInterface, Register, SessionMeasureInput } from 'claude-code'
 
 import type { Limit, Stats } from '../types'
 
@@ -100,6 +100,12 @@ const bandSvg = (s: Stats, now: number): { source: string; width: number } => {
       gap(6)
       text(reset, 'm')
     }
+    if (l.kind === 'five_hour' && s.cap5h !== undefined) {
+      gap(10)
+      text('cap', 'l')
+      gap(4)
+      text(`≈${money(s.cap5h)}`, `v t-${hue}`, true)
+    }
   })
 
   if (s.last) {
@@ -151,9 +157,25 @@ ${paletteCss(1)}}`
 
 const label: Record<string, string> = { five_hour: '5h', seven_day: '7d' }
 
+const money = (v: number) => `$${v.toFixed(v >= 100 ? 0 : v >= 10 ? 1 : 2)}`
+
+// One observation: this session spent dCost while the 5h window rose dPct points.
+type Sample = { t: number; dCost: number; dPct: number }
+const SAMPLES = 'cap5h.samples'
+const KEEP_MS = 7 * 24 * 3600_000
+// Below this many points of movement the 0.1-point rounding swamps the ratio.
+const MIN_PCT = 2
+
+const capFrom = (samples: Sample[]) => {
+  const pct = samples.reduce((n, x) => n + x.dPct, 0)
+  const usd = samples.reduce((n, x) => n + x.dCost, 0)
+  return pct >= MIN_PCT ? (usd / pct) * 100 : undefined
+}
+
 const altText = (s: Stats, now: number) =>
   [
     ...s.limits.map(l => `${label[l.kind] ?? l.kind} ${l.percentUsed}% (resets in ${left(l.resetsAt, now)})`),
+    s.cap5h !== undefined && `5h cap about ${money(s.cap5h)} at API prices`,
     s.last && `in ${k(s.last.input)}, out ${k(s.last.output)}, ${s.last.tps} t/s, cache ${k(s.last.cacheRead)}`,
     s.costUsd !== undefined && `$${s.costUsd.toFixed(2)}`,
     s.ctxPercent !== undefined && `context ${s.ctxPercent}%`,
@@ -161,28 +183,45 @@ const altText = (s: Stats, now: number) =>
     .filter(Boolean)
     .join(' · ')
 
+// The last reading of this session: the cost and the 5h percentage, and which window.
+// A module variable on purpose: after a reload the next reading only sets a fresh baseline.
+let baseline: { cost: number; pct: number; window: string } | undefined
+
+async function apply($: EngineInterface, r: SessionMeasureInput) {
+  const { value: s = empty } = await $.state.get(stats)
+  let cap5h = s.cap5h
+  const fh = r.rateLimits.find(l => l.kind === 'five_hour')
+  const cost = r.cost?.usd
+  if (fh && cost !== undefined) {
+    const now = await $.clock.now()
+    const window = fh.resetsAt ? new Date(Math.round(Date.parse(fh.resetsAt) / 60_000) * 60_000).toISOString() : ''
+    let samples = (((await $.store.get(SAMPLES)) as Sample[] | undefined) ?? []).filter(x => now - x.t < KEEP_MS)
+    if (baseline && baseline.window === window && cost > baseline.cost && fh.percentUsed >= baseline.pct) {
+      samples = [...samples, { t: now, dCost: cost - baseline.cost, dPct: fh.percentUsed - baseline.pct }].slice(-2000)
+      await $.store.set(SAMPLES, samples)
+    }
+    baseline = { cost, pct: fh.percentUsed, window }
+    cap5h = capFrom(samples)
+  }
+  await $.state.set(stats, {
+    ...s,
+    limits: r.rateLimits.map(({ kind, percentUsed, resetsAt }): Limit => ({ kind, percentUsed, resetsAt })),
+    ctxPercent: r.context.percent,
+    costUsd: cost,
+    cap5h,
+  })
+}
+
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     const r = await next(e)
     const u = await $.session.usage()
-    const { value: s = empty } = await $.state.get(stats)
-    await $.state.set(stats, {
-      ...s,
-      limits: u.rateLimits.map(({ kind, percentUsed, resetsAt }): Limit => ({ kind, percentUsed, resetsAt })),
-      ctxPercent: u.context.percent,
-      costUsd: u.cost?.usd,
-    })
+    await apply($, { context: u.context, rateLimits: u.rateLimits, cost: u.cost, changed: [] })
     return r
   })
 
   on('session.measure', async ($, e, next) => {
-    const { value: s = empty } = await $.state.get(stats)
-    await $.state.set(stats, {
-      ...s,
-      limits: e.rateLimits.map(({ kind, percentUsed, resetsAt }): Limit => ({ kind, percentUsed, resetsAt })),
-      ctxPercent: e.context.percent,
-      costUsd: e.cost?.usd,
-    })
+    await apply($, e)
     return next(e)
   })
 
@@ -231,6 +270,7 @@ export const register: Register = on => {
             <Text dimColor>{label[l.kind] ?? l.kind} </Text>
             <Text bold color={tone(l.percentUsed)}>{l.percentUsed}%</Text>
             <Text dimColor> {left(l.resetsAt, now)}</Text>
+            {l.kind === 'five_hour' && s.cap5h !== undefined && <Text dimColor> cap ≈{money(s.cap5h)}</Text>}
           </Text>
         ))}
         {s.last && (

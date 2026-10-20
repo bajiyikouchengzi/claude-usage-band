@@ -11,6 +11,7 @@ A Claude Code plugin that adds a slim usage band above the prompt, in the Claude
 | Item | Meaning |
 | --- | --- |
 | `5h` / `7d` | Rate-limit windows: percent used and time until reset (subscription accounts only) |
+| `cap ≈$…` | Estimated size of the 5h window in dollars at API list prices, learned from how far the 5h percentage moves while you spend (shown once it has seen 2+ points of movement; pooled over the last 7 days) |
 | `in` / `out` / `cache` | Last turn's uncached input, output and cache-read tokens |
 | `t/s` | Last turn's output tokens ÷ turn wall time (approximate; includes tool time) |
 | `$` | Session cost at API list prices (not what a subscription is billed) |
